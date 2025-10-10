@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from itertools import cycle
-from typing import Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple, Set
 import logging
 
 import pandas as pd
@@ -981,35 +981,416 @@ def calculate_availability(
     if df is None or df.empty:
         return {
             "total_minutes": 0,
+            "effective_minutes": 0,
             "available_minutes": 0,
             "unavailable_minutes": 0,
+            "missing_minutes": 0,
             "pct_available": 0.0,
             "pct_unavailable": 0.0
         }
-    
+
     total = int(df["duration_minutes"].sum())
-    
+
+    missing_minutes = int(
+        df.loc[df["est_disponible"] == -1, "duration_minutes"].sum()
+    )
+
     if include_exclusions:
-        available = int(
-            df.loc[
-                (df["est_disponible"] == 1) | (df["is_excluded"] == 1),
-                "duration_minutes"
-            ].sum()
+        available_mask = (
+            (df["est_disponible"] == 1)
+            | ((df["est_disponible"] == 0) & (df["is_excluded"] == 1))
+        )
+        unavailable_mask = (
+            (df["est_disponible"] == 0) & (df["is_excluded"] == 0)
         )
     else:
-        available = int(df.loc[df["est_disponible"] == 1, "duration_minutes"].sum())
-    
-    unavailable = total - available
-    pct_available = (available / total * 100) if total > 0 else 0.0
-    pct_unavailable = (unavailable / total * 100) if total > 0 else 0.0
-    
+        available_mask = df["est_disponible"] == 1
+        unavailable_mask = df["est_disponible"] == 0
+
+    available = int(df.loc[available_mask, "duration_minutes"].sum())
+    unavailable = int(df.loc[unavailable_mask, "duration_minutes"].sum())
+    effective_total = available + unavailable
+
+    pct_available = (available / effective_total * 100) if effective_total > 0 else 0.0
+    pct_unavailable = (unavailable / effective_total * 100) if effective_total > 0 else 0.0
+
     return {
         "total_minutes": total,
+        "effective_minutes": effective_total,
         "available_minutes": available,
         "unavailable_minutes": unavailable,
+        "missing_minutes": missing_minutes,
         "pct_available": pct_available,
         "pct_unavailable": pct_unavailable
     }
+
+
+def _station_equipment_modes() -> List[Tuple[str, str]]:
+    equipments = [("AC", MODE_EQUIPMENT), ("DC1", MODE_EQUIPMENT), ("DC2", MODE_EQUIPMENT)]
+    equipments.extend([(f"PDC{i}", MODE_PDC) for i in range(1, 7)])
+    return equipments
+
+
+def _ensure_paris_timestamp(value: Any) -> Optional[pd.Timestamp]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    try:
+        ts = pd.Timestamp(value)
+    except Exception:
+        return None
+
+    try:
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="infer")
+        else:
+            ts = ts.tz_convert("Europe/Paris")
+    except Exception:
+        try:
+            ts = ts.tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="NaT")
+        except Exception:
+            return None
+
+    if pd.isna(ts):
+        return None
+    return ts
+
+
+def _build_station_timeline_df(timelines: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    records: List[Dict[str, Any]] = []
+    for equip, df in timelines.items():
+        if df is None or df.empty:
+            continue
+        for _, row in df.iterrows():
+            start_ts = _ensure_paris_timestamp(row.get("date_debut"))
+            end_ts = _ensure_paris_timestamp(row.get("date_fin"))
+            if start_ts is None or end_ts is None or end_ts <= start_ts:
+                continue
+            records.append(
+                {
+                    "Equipement": equip,
+                    "start": start_ts,
+                    "end": end_ts,
+                    "est_disponible": int(row.get("est_disponible", 0)),
+                    "is_excluded": int(row.get("is_excluded", 0)),
+                    "cause": row.get("cause"),
+                    "duration_minutes": int(row.get("duration_minutes", 0)),
+                }
+            )
+
+    timeline_df = pd.DataFrame.from_records(records)
+    if timeline_df.empty:
+        return timeline_df
+
+    state_map = {
+        1: "✅ Disponible",
+        0: "❌ Indisponible",
+        -1: "⚠️ Donnée manquante",
+    }
+    timeline_df["state"] = timeline_df["est_disponible"].map(state_map).fillna("❓ Inconnu")
+    timeline_df["label"] = timeline_df["state"] + timeline_df["is_excluded"].map({1: " (Exclu)", 0: ""}).fillna("")
+    return timeline_df.sort_values(["Equipement", "start"]).reset_index(drop=True)
+
+
+def _new_condition_tracker(label: str) -> Dict[str, Any]:
+    return {
+        "label": label,
+        "duration": 0.0,
+        "occurrences": 0,
+        "intervals": [],
+        "active": False,
+        "current_start": None,
+        "denom": 0.0,
+    }
+
+
+def _update_condition_tracker(
+    tracker: Dict[str, Any],
+    is_active: bool,
+    has_data: bool,
+    seg_start: pd.Timestamp,
+    seg_end: pd.Timestamp,
+    duration: float,
+) -> None:
+    if has_data:
+        tracker["denom"] += duration
+    if not has_data:
+        if tracker["active"]:
+            tracker["intervals"].append((tracker["current_start"], seg_start))
+            tracker["occurrences"] += 1
+            tracker["active"] = False
+            tracker["current_start"] = None
+        return
+
+    if is_active:
+        tracker["duration"] += duration
+        if not tracker["active"]:
+            tracker["active"] = True
+            tracker["current_start"] = seg_start
+    else:
+        if tracker["active"]:
+            tracker["intervals"].append((tracker["current_start"], seg_start))
+            tracker["occurrences"] += 1
+            tracker["active"] = False
+            tracker["current_start"] = None
+
+
+def _finalize_condition_tracker(tracker: Dict[str, Any], end_ts: pd.Timestamp) -> None:
+    if tracker["active"] and tracker["current_start"] is not None:
+        tracker["intervals"].append((tracker["current_start"], end_ts))
+        tracker["occurrences"] += 1
+        tracker["active"] = False
+        tracker["current_start"] = None
+
+
+def _format_interval_summary(intervals: List[Tuple[pd.Timestamp, pd.Timestamp]], limit: int = 3) -> str:
+    if not intervals:
+        return "-"
+    formatted = [
+        f"{start.strftime('%d/%m %H:%M')} → {end.strftime('%d/%m %H:%M')}"
+        for start, end in intervals[:limit]
+    ]
+    if len(intervals) > limit:
+        formatted.append(f"+{len(intervals) - limit} autres")
+    return "\n".join(formatted)
+
+
+def _build_interval_table(intervals: List[Tuple[pd.Timestamp, pd.Timestamp]]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for idx, (start, end) in enumerate(intervals, 1):
+        duration = max(int(round((end - start).total_seconds() / 60)), 0)
+        rows.append(
+            {
+                "Période": idx,
+                "Début": start,
+                "Fin": end,
+                "Durée_Minutes": duration,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _analyze_station_conditions(
+    timelines: Dict[str, pd.DataFrame],
+    start_dt: datetime,
+    end_dt: datetime,
+) -> Dict[str, Any]:
+    start_ts = _ensure_paris_timestamp(start_dt)
+    end_ts = _ensure_paris_timestamp(end_dt)
+
+    if start_ts is None or end_ts is None or end_ts <= start_ts:
+        empty_df = pd.DataFrame()
+        return {
+            "summary_df": empty_df,
+            "metrics": {
+                "reference_minutes": 0,
+                "downtime_minutes": 0,
+                "uptime_minutes": 0,
+                "availability_pct": 0.0,
+                "coverage_pct": 0.0,
+                "window_minutes": 0,
+                "downtime_occurrences": 0,
+            },
+            "condition_intervals": {},
+            "downtime_intervals": [],
+        }
+
+    intervals_by_equip: Dict[str, List[Tuple[pd.Timestamp, pd.Timestamp, int]]] = {}
+    boundaries: Set[pd.Timestamp] = {start_ts, end_ts}
+
+    for equip, df in timelines.items():
+        equip_intervals: List[Tuple[pd.Timestamp, pd.Timestamp, int]] = []
+        if df is not None and not df.empty:
+            for _, row in df.iterrows():
+                raw_start = _ensure_paris_timestamp(row.get("date_debut"))
+                raw_end = _ensure_paris_timestamp(row.get("date_fin"))
+                if raw_start is None or raw_end is None:
+                    continue
+                seg_start = max(raw_start, start_ts)
+                seg_end = min(raw_end, end_ts)
+                if seg_end <= seg_start:
+                    continue
+                status = int(row.get("est_disponible", -1))
+                equip_intervals.append((seg_start, seg_end, status))
+                boundaries.add(seg_start)
+                boundaries.add(seg_end)
+        equip_intervals.sort(key=lambda item: item[0])
+        intervals_by_equip[equip] = equip_intervals
+
+    if len(boundaries) <= 1:
+        empty_df = pd.DataFrame()
+        return {
+            "summary_df": empty_df,
+            "metrics": {
+                "reference_minutes": 0,
+                "downtime_minutes": 0,
+                "uptime_minutes": 0,
+                "availability_pct": 0.0,
+                "coverage_pct": 0.0,
+                "window_minutes": 0,
+                "downtime_occurrences": 0,
+            },
+            "condition_intervals": {},
+            "downtime_intervals": [],
+        }
+
+    ordered_boundaries = sorted(boundaries)
+
+    def status_at(intervals: List[Tuple[pd.Timestamp, pd.Timestamp, int]], ts: pd.Timestamp) -> int:
+        for start, end, status in intervals:
+            if start <= ts < end:
+                return status
+        return -1
+
+    condition_labels = {
+        "ac_down": "Réseau AC indisponible",
+        "batt_down": "DC1 & DC2 indisponibles",
+        "pdc_down": "≥3 PDC indisponibles",
+    }
+    trackers = {key: _new_condition_tracker(label) for key, label in condition_labels.items()}
+
+    station_tracker = {
+        "duration": 0.0,
+        "occurrences": 0,
+        "intervals": [],
+        "active": False,
+        "current_start": None,
+    }
+
+    reference_minutes = 0.0
+    window_minutes = max(int(round((end_ts - start_ts).total_seconds() / 60)), 0)
+
+    pdc_names = [f"PDC{i}" for i in range(1, 7)]
+
+    for idx in range(len(ordered_boundaries) - 1):
+        seg_start = ordered_boundaries[idx]
+        seg_end = ordered_boundaries[idx + 1]
+        if seg_end <= seg_start:
+            continue
+
+        duration = (seg_end - seg_start).total_seconds() / 60
+        if duration <= 0:
+            continue
+
+        ac_status = status_at(intervals_by_equip.get("AC", []), seg_start)
+        dc1_status = status_at(intervals_by_equip.get("DC1", []), seg_start)
+        dc2_status = status_at(intervals_by_equip.get("DC2", []), seg_start)
+        pdc_statuses = [status_at(intervals_by_equip.get(name, []), seg_start) for name in pdc_names]
+
+        ac_data = ac_status in (0, 1)
+        batt_data = (dc1_status in (0, 1)) and (dc2_status in (0, 1))
+        pdc_data = all(status in (0, 1) for status in pdc_statuses)
+
+        ac_down = ac_data and ac_status == 0
+        batt_down = batt_data and dc1_status == 0 and dc2_status == 0
+        pdc_down = pdc_data and sum(status == 0 for status in pdc_statuses) >= 3
+
+        segment_has_data = ac_data or batt_data or pdc_data
+
+        if segment_has_data:
+            reference_minutes += duration
+        else:
+            if station_tracker["active"]:
+                station_tracker["intervals"].append((station_tracker["current_start"], seg_start))
+                station_tracker["occurrences"] += 1
+                station_tracker["active"] = False
+                station_tracker["current_start"] = None
+
+        _update_condition_tracker(trackers["ac_down"], ac_down, ac_data, seg_start, seg_end, duration)
+        _update_condition_tracker(trackers["batt_down"], batt_down, batt_data, seg_start, seg_end, duration)
+        _update_condition_tracker(trackers["pdc_down"], pdc_down, pdc_data, seg_start, seg_end, duration)
+
+        any_condition = (
+            (ac_down and ac_data)
+            or (batt_down and batt_data)
+            or (pdc_down and pdc_data)
+        )
+
+        if segment_has_data and any_condition:
+            station_tracker["duration"] += duration
+            if not station_tracker["active"]:
+                station_tracker["active"] = True
+                station_tracker["current_start"] = seg_start
+        else:
+            if station_tracker["active"]:
+                station_tracker["intervals"].append((station_tracker["current_start"], seg_start))
+                station_tracker["occurrences"] += 1
+                station_tracker["active"] = False
+                station_tracker["current_start"] = None
+
+    for tracker in trackers.values():
+        _finalize_condition_tracker(tracker, end_ts)
+
+    if station_tracker["active"] and station_tracker["current_start"] is not None:
+        station_tracker["intervals"].append((station_tracker["current_start"], end_ts))
+        station_tracker["occurrences"] += 1
+        station_tracker["active"] = False
+        station_tracker["current_start"] = None
+
+    reference_minutes_int = max(int(round(reference_minutes)), 0)
+    downtime_minutes_int = max(int(round(station_tracker["duration"])), 0)
+    uptime_minutes_int = max(reference_minutes_int - downtime_minutes_int, 0)
+
+    availability_pct = (uptime_minutes_int / reference_minutes_int * 100) if reference_minutes_int > 0 else 0.0
+    coverage_pct = (reference_minutes_int / window_minutes * 100) if window_minutes > 0 else 0.0
+
+    summary_rows: List[Dict[str, Any]] = []
+    condition_intervals: Dict[str, List[Tuple[pd.Timestamp, pd.Timestamp]]] = {}
+
+    for tracker in trackers.values():
+        duration_int = max(int(round(tracker["duration"])), 0)
+        analyzed_int = max(int(round(tracker["denom"])), 0)
+        pct_condition = (duration_int / analyzed_int * 100) if analyzed_int > 0 else 0.0
+        pct_station = (duration_int / reference_minutes_int * 100) if reference_minutes_int > 0 else 0.0
+        coverage_condition = (analyzed_int / window_minutes * 100) if window_minutes > 0 else 0.0
+
+        summary_rows.append(
+            {
+                "Condition": tracker["label"],
+                "Occurrences": tracker["occurrences"],
+                "Durée_Minutes": duration_int,
+                "Temps_Analysé_Minutes": analyzed_int,
+                "Part_Temps_Analysé": round(pct_condition, 2),
+                "Part_Temps_Station": round(pct_station, 2),
+                "Couverture_Période": round(coverage_condition, 1),
+                "Périodes_Clés": _format_interval_summary(tracker["intervals"]),
+            }
+        )
+        condition_intervals[tracker["label"]] = tracker["intervals"]
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    return {
+        "summary_df": summary_df,
+        "metrics": {
+            "reference_minutes": reference_minutes_int,
+            "downtime_minutes": downtime_minutes_int,
+            "uptime_minutes": uptime_minutes_int,
+            "availability_pct": round(availability_pct, 2),
+            "coverage_pct": round(coverage_pct, 1),
+            "window_minutes": window_minutes,
+            "downtime_occurrences": station_tracker["occurrences"],
+        },
+        "condition_intervals": condition_intervals,
+        "downtime_intervals": station_tracker["intervals"],
+    }
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_station_statistics(site: str, start_dt: datetime, end_dt: datetime) -> Dict[str, Any]:
+    timelines: Dict[str, pd.DataFrame] = {}
+
+    for equip, mode in _station_equipment_modes():
+        try:
+            df = load_blocks(site, equip, start_dt, end_dt, mode=mode)
+        except Exception as exc:
+            logger.error("Erreur lors du chargement de %s pour %s : %s", equip, site, exc)
+            df = pd.DataFrame()
+        timelines[equip] = df.copy() if df is not None and not df.empty else pd.DataFrame()
+
+    analysis = _analyze_station_conditions(timelines, start_dt, end_dt)
+    analysis["timeline_df"] = _build_station_timeline_df(timelines)
+    return analysis
+
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _calculate_monthly_availability_equipment(
@@ -3531,6 +3912,238 @@ def calcul():
     pdc_block("PDC5", "14")
     pdc_block("PDC6", "24")
 
+
+def render_statistics_tab() -> None:
+    """Affiche la vue statistique multi-équipements pour chaque site."""
+
+    st.header("📊 Vue Statistique Stations")
+    st.caption("Analyse les indisponibilités critiques AC, DC et PDC en excluant les pertes de données.")
+
+    available_sites = get_sites(MODE_EQUIPMENT)
+    if not available_sites:
+        st.warning("Aucun site disponible pour l'analyse statistique.")
+        return
+
+    current_site = st.session_state.get("current_site")
+    if current_site and current_site in available_sites:
+        default_sites = [current_site]
+    else:
+        default_sites = available_sites[:1]
+
+    selected_sites = st.multiselect(
+        "Sites à analyser",
+        options=available_sites,
+        default=default_sites,
+        format_func=lambda code: mapping_sites.get(code.split("_")[-1], code),
+        help="Sélectionnez un ou plusieurs sites pour visualiser leurs statistiques détaillées."
+    )
+
+    session_start = st.session_state.get("current_start_dt")
+    session_end = st.session_state.get("current_end_dt")
+
+    if not isinstance(session_start, datetime):
+        session_start = datetime.now() - timedelta(days=7)
+    if not isinstance(session_end, datetime):
+        session_end = datetime.now()
+
+    col_start, col_end = st.columns(2)
+    start_date = col_start.date_input(
+        "Date de début",
+        value=session_start.date(),
+        max_value=session_end.date(),
+        help="Date de début de la fenêtre d'analyse statistique."
+    )
+    end_date = col_end.date_input(
+        "Date de fin",
+        value=session_end.date(),
+        min_value=start_date,
+        help="Date de fin de la fenêtre d'analyse statistique."
+    )
+
+    start_dt = datetime.combine(start_date, time.min)
+    end_dt = datetime.combine(end_date, time.max)
+
+    st.caption("Les métriques calculées considèrent la station indisponible dès qu'une condition critique est vraie.")
+
+    if not selected_sites:
+        st.info("Sélectionnez au moins un site pour afficher la vue statistique.")
+        return
+
+    for idx, site in enumerate(selected_sites, start=1):
+        site_label = mapping_sites.get(site.split("_")[-1], site)
+        st.subheader(f"📍 {site_label} ({site})")
+
+        try:
+            with st.spinner(f"Analyse des conditions critiques pour {site_label}..."):
+                stats = load_station_statistics(site, start_dt, end_dt)
+        except Exception as exc:
+            logger.error("Erreur lors de l'analyse statistique pour %s : %s", site, exc)
+            st.error(f"❌ Impossible de calculer les statistiques pour {site_label}. {exc}")
+            if idx < len(selected_sites):
+                st.divider()
+            continue
+
+        summary_df = stats.get("summary_df", pd.DataFrame())
+        metrics = stats.get("metrics", {})
+        timeline_df = stats.get("timeline_df", pd.DataFrame())
+        condition_intervals = stats.get("condition_intervals", {})
+        downtime_intervals = stats.get("downtime_intervals", [])
+
+        availability_pct = float(metrics.get("availability_pct", 0.0) or 0.0)
+        downtime_minutes = int(metrics.get("downtime_minutes", 0) or 0)
+        reference_minutes = int(metrics.get("reference_minutes", 0) or 0)
+        uptime_minutes = int(metrics.get("uptime_minutes", max(reference_minutes - downtime_minutes, 0)))
+        window_minutes = int(metrics.get("window_minutes", 0) or 0)
+        coverage_pct = float(metrics.get("coverage_pct", 0.0) or 0.0)
+        downtime_occurrences = int(metrics.get("downtime_occurrences", 0) or 0)
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Disponibilité estimée", f"{availability_pct:.2f}%")
+        with col2:
+            st.metric("Indisponibilité cumulée", format_minutes(downtime_minutes))
+        with col3:
+            st.metric(
+                "Temps analysé",
+                format_minutes(reference_minutes),
+                help=f"{coverage_pct:.1f}% du total ({format_minutes(window_minutes)})"
+            )
+        with col4:
+            st.metric("Occurrences station", downtime_occurrences)
+
+        if window_minutes > 0 and coverage_pct < 80:
+            st.warning("Couverture partielle des données : certaines périodes n'ont pas pu être analysées.")
+
+        if not summary_df.empty:
+            display_df = summary_df.copy()
+            display_df["Durée (min)"] = display_df["Durée_Minutes"].astype(int)
+            display_df["Durée"] = display_df["Durée_Minutes"].apply(lambda m: format_minutes(int(m)))
+            display_df["Temps analysé (min)"] = display_df["Temps_Analysé_Minutes"].astype(int)
+            display_df["Temps analysé"] = display_df["Temps_Analysé_Minutes"].apply(lambda m: format_minutes(int(m)))
+            display_df["Part du temps analysé (%)"] = display_df["Part_Temps_Analysé"].astype(float)
+            display_df["Part du temps station (%)"] = display_df["Part_Temps_Station"].astype(float)
+            display_df["Couverture période (%)"] = display_df["Couverture_Période"].astype(float)
+            display_df["Périodes clés"] = display_df["Périodes_Clés"]
+
+            ordered_columns = [
+                "Condition",
+                "Occurrences",
+                "Durée (min)",
+                "Durée",
+                "Temps analysé (min)",
+                "Temps analysé",
+                "Part du temps analysé (%)",
+                "Part du temps station (%)",
+                "Couverture période (%)",
+                "Périodes clés",
+            ]
+
+            display_df = display_df[ordered_columns]
+
+            st.dataframe(
+                display_df,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Condition": st.column_config.TextColumn("Condition", width="large"),
+                    "Occurrences": st.column_config.NumberColumn("Occurrences", width="small"),
+                    "Durée (min)": st.column_config.NumberColumn("Durée (min)", width="small"),
+                    "Durée": st.column_config.TextColumn("Durée", width="medium"),
+                    "Temps analysé (min)": st.column_config.NumberColumn("Temps analysé (min)", width="small"),
+                    "Temps analysé": st.column_config.TextColumn("Temps analysé", width="medium"),
+                    "Part du temps analysé (%)": st.column_config.NumberColumn("% temps analysé", format="%.2f%%", width="small"),
+                    "Part du temps station (%)": st.column_config.NumberColumn("% temps station", format="%.2f%%", width="small"),
+                    "Couverture période (%)": st.column_config.NumberColumn("Couverture période (%)", format="%.1f%%", width="small"),
+                    "Périodes clés": st.column_config.TextColumn("Périodes clés", width="large"),
+                }
+            )
+        else:
+            st.success("Aucune condition critique détectée sur la période analysée.")
+
+        for label, intervals in condition_intervals.items():
+            interval_df = _build_interval_table(intervals)
+            if interval_df.empty:
+                continue
+            with st.expander(f"Détails — {label} ({len(intervals)} période{'s' if len(intervals) > 1 else ''})"):
+                table_display = interval_df.copy()
+                table_display["Début"] = table_display["Début"].dt.strftime("%Y-%m-%d %H:%M")
+                table_display["Fin"] = table_display["Fin"].dt.strftime("%Y-%m-%d %H:%M")
+                table_display["Durée"] = table_display["Durée_Minutes"].apply(lambda m: format_minutes(int(m)))
+                table_display = table_display.rename(columns={"Durée_Minutes": "Durée (min)"})
+                st.dataframe(
+                    table_display[["Période", "Début", "Fin", "Durée (min)", "Durée"]],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+        downtime_df = _build_interval_table(downtime_intervals)
+        if not downtime_df.empty:
+            with st.expander(f"Périodes d'indisponibilité station ({len(downtime_intervals)})"):
+                dt_display = downtime_df.copy()
+                dt_display["Début"] = dt_display["Début"].dt.strftime("%Y-%m-%d %H:%M")
+                dt_display["Fin"] = dt_display["Fin"].dt.strftime("%Y-%m-%d %H:%M")
+                dt_display["Durée"] = dt_display["Durée_Minutes"].apply(lambda m: format_minutes(int(m)))
+                dt_display = dt_display.rename(columns={"Durée_Minutes": "Durée (min)"})
+                st.dataframe(
+                    dt_display[["Période", "Début", "Fin", "Durée (min)", "Durée"]],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+        else:
+            st.info("Aucune période d'indisponibilité cumulée détectée pour la station.")
+
+        if not timeline_df.empty:
+            order = ["AC", "DC1", "DC2"] + [f"PDC{i}" for i in range(1, 7)]
+            available_order = [item for item in order if item in timeline_df["Equipement"].unique()]
+            if not available_order:
+                available_order = timeline_df["Equipement"].unique().tolist()
+
+            color_map = {
+                "✅ Disponible": "#28a745",
+                "✅ Disponible (Exclu)": "#20c997",
+                "❌ Indisponible": "#dc3545",
+                "❌ Indisponible (Exclu)": "#fd7e14",
+                "⚠️ Donnée manquante": "#6c757d",
+                "⚠️ Donnée manquante (Exclu)": "#BBDB07",
+                "❓ Inconnu": "#adb5bd",
+                "❓ Inconnu (Exclu)": "#868e96",
+            }
+
+            fig = px.timeline(
+                timeline_df,
+                x_start="start",
+                x_end="end",
+                y="Equipement",
+                color="label",
+                hover_data={
+                    "cause": True,
+                    "duration_minutes": True,
+                    "start": "|%Y-%m-%d %H:%M",
+                    "end": "|%Y-%m-%d %H:%M",
+                    "Equipement": False,
+                    "label": False,
+                },
+                category_orders={"Equipement": available_order},
+                color_discrete_map=color_map,
+            )
+            fig.update_yaxes(autorange="reversed", title="")
+            fig.update_xaxes(title="Période")
+            base_height = 120 + 40 * len(available_order)
+            fig.update_layout(
+                height=max(360, base_height),
+                showlegend=True,
+                title=f"Timeline des équipements — {site_label}",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("Aucune donnée de timeline disponible pour cette période.")
+
+        st.caption(f"Temps disponible estimé : {format_minutes(uptime_minutes)}")
+
+        if idx < len(selected_sites):
+            st.divider()
+
+
 def main():
     """Point d'entrée principal de l'application."""
     
@@ -3569,6 +4182,7 @@ def main():
     
     tabs = st.tabs([
         "📈 Vue d'ensemble",
+        "📊 Vue statistique",
         "🌍 Comparaison sites",
         "⏱️ Timeline & Annotations",
         "📊 Rapport",
@@ -3582,24 +4196,27 @@ def main():
         render_overview_tab(df_filtered)
 
     with tabs[1]:
-        render_global_comparison_tab(start_dt, end_dt)
+        render_statistics_tab()
 
     with tabs[2]:
-        render_timeline_tab(site, equip, start_dt, end_dt)
+        render_global_comparison_tab(start_dt, end_dt)
 
     with tabs[3]:
-        render_report_tab()
+        render_timeline_tab(site, equip, start_dt, end_dt)
 
     with tabs[4]:
-        render_exclusions_tab()
+        render_report_tab()
 
     with tabs[5]:
-        render_comments_tab()
+        render_exclusions_tab()
 
     with tabs[6]:
-        calcul()
-        
+        render_comments_tab()
+
     with tabs[7]:
+        calcul()
+
+    with tabs[8]:
         render_contract_tab(site, start_dt, end_dt)
 
     st.divider()
