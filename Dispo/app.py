@@ -351,14 +351,17 @@ def _load_blocks_equipment(site: str, equip: str, start_dt: datetime, end_dt: da
     b.site, b.equipement_id, b.type_equipement, b.date_debut, b.date_fin,
     b.est_disponible, b.cause, b.raw_point_count, b.processed_at, b.batch_id, b.hash_signature,
     TIMESTAMPDIFF(MINUTE, b.date_debut, b.date_fin) AS duration_minutes,
-    CAST(EXISTS (
-        SELECT 1 FROM dispo_annotations a
-        WHERE a.actif = 1
-        AND a.type_annotation = 'exclusion'
-        AND a.site = b.site
-        AND a.equipement_id = b.equipement_id
-        AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
-    ) AS UNSIGNED) AS is_excluded
+    CASE
+        WHEN b.est_disponible <> 1 THEN CAST(EXISTS (
+            SELECT 1 FROM dispo_annotations a
+            WHERE a.actif = 1
+            AND a.type_annotation = 'exclusion'
+            AND a.site = b.site
+            AND a.equipement_id = b.equipement_id
+            AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
+        ) AS UNSIGNED)
+        ELSE 0
+    END AS is_excluded
     FROM base b
     WHERE b.equipement_id = :equip
     AND b.date_debut < :end
@@ -390,14 +393,17 @@ def _load_blocks_pdc(site: str, equip: str, start_dt: datetime, end_dt: datetime
       p.batch_id,
       p.hash_signature,
       TIMESTAMPDIFF(MINUTE, p.date_debut, p.date_fin) AS duration_minutes,
-      CAST(EXISTS (
-        SELECT 1 FROM dispo_annotations a
-        WHERE a.actif = 1
-          AND a.type_annotation = 'exclusion'
-          AND a.site = p.site
-          AND a.equipement_id = p.equipement_id
-          AND NOT (a.date_fin <= p.date_debut OR a.date_debut >= p.date_fin)
-      ) AS UNSIGNED) AS is_excluded
+      CASE
+        WHEN p.est_disponible <> 1 THEN CAST(EXISTS (
+            SELECT 1 FROM dispo_annotations a
+            WHERE a.actif = 1
+              AND a.type_annotation = 'exclusion'
+              AND a.site = p.site
+              AND a.equipement_id = p.equipement_id
+              AND NOT (a.date_fin <= p.date_debut OR a.date_debut >= p.date_fin)
+        ) AS UNSIGNED)
+        ELSE 0
+      END AS is_excluded
     FROM pdc p
     WHERE p.equipement_id = :equip
       AND p.date_debut < :end
@@ -466,14 +472,17 @@ def _load_filtered_blocks_equipment(start_dt: datetime, end_dt: datetime, site: 
     b.site, b.equipement_id, b.type_equipement, b.date_debut, b.date_fin,
     b.est_disponible, b.cause, b.raw_point_count, b.processed_at, b.batch_id, b.hash_signature,
     TIMESTAMPDIFF(MINUTE, b.date_debut, b.date_fin) AS duration_minutes,
-    CAST(EXISTS (
-        SELECT 1 FROM dispo_annotations a
-        WHERE a.actif = 1
-        AND a.type_annotation = 'exclusion'
-        AND a.site = b.site
-        AND a.equipement_id = b.equipement_id
-        AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
-    ) AS UNSIGNED) AS is_excluded
+    CASE
+        WHEN b.est_disponible <> 1 THEN CAST(EXISTS (
+            SELECT 1 FROM dispo_annotations a
+            WHERE a.actif = 1
+            AND a.type_annotation = 'exclusion'
+            AND a.site = b.site
+            AND a.equipement_id = b.equipement_id
+            AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
+        ) AS UNSIGNED)
+        ELSE 0
+    END AS is_excluded
     FROM base b
     WHERE b.date_debut < :end
     AND b.date_fin   > :start
@@ -516,14 +525,17 @@ def _load_filtered_blocks_pdc(start_dt: datetime, end_dt: datetime, site: Option
       p.batch_id,
       p.hash_signature,
       TIMESTAMPDIFF(MINUTE, p.date_debut, p.date_fin) AS duration_minutes,
-      CAST(EXISTS (
-        SELECT 1 FROM dispo_annotations a
-        WHERE a.actif = 1
-          AND a.type_annotation = 'exclusion'
-          AND a.site = p.site
-          AND a.equipement_id = p.equipement_id
-          AND NOT (a.date_fin <= p.date_debut OR a.date_debut >= p.date_fin)
-      ) AS UNSIGNED) AS is_excluded
+      CASE
+        WHEN p.est_disponible <> 1 THEN CAST(EXISTS (
+            SELECT 1 FROM dispo_annotations a
+            WHERE a.actif = 1
+              AND a.type_annotation = 'exclusion'
+              AND a.site = p.site
+              AND a.equipement_id = p.equipement_id
+              AND NOT (a.date_fin <= p.date_debut OR a.date_debut >= p.date_fin)
+        ) AS UNSIGNED)
+        ELSE 0
+      END AS is_excluded
     FROM pdc p
     WHERE p.date_debut < :end
       AND p.date_fin > :start
@@ -543,16 +555,16 @@ def load_filtered_blocks(start_dt: datetime, end_dt: datetime, site: Optional[st
     return _load_filtered_blocks_equipment(start_dt, end_dt, site, equip)
 
 # Gestion
-def create_annotation(
+def _insert_annotation(
     site: str,
     equip: str,
     start_dt: datetime,
     end_dt: datetime,
     annotation_type: str,
     comment: str,
-    user: str = "ui"
+    user: str = "ui",
 ) -> bool:
-    """Crée une nouvelle annotation."""
+    """Insère une annotation sans logique additionnelle."""
     query = """
         INSERT INTO dispo_annotations
         (site, equipement_id, date_debut, date_fin, type_annotation, commentaire, actif, created_by)
@@ -568,6 +580,50 @@ def create_annotation(
         "user": user
     }
     return execute_write(query, params)
+
+
+def create_annotation(
+    site: str,
+    equip: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    annotation_type: str,
+    comment: str,
+    user: str = "ui",
+    cascade: bool = True,
+) -> bool:
+    """Crée une nouvelle annotation et applique les éventuelles règles métiers."""
+    success = _insert_annotation(
+        site=site,
+        equip=equip,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        annotation_type=annotation_type,
+        comment=comment,
+        user=user,
+    )
+
+    if not success:
+        return False
+
+    if (
+        cascade
+        and annotation_type == "exclusion"
+        and equip
+        and equip.upper().startswith("AC")
+    ):
+        for idx in range(1, 7):
+            _insert_annotation(
+                site=site,
+                equip=f"PDC{idx}",
+                start_dt=start_dt,
+                end_dt=end_dt,
+                annotation_type=annotation_type,
+                comment=comment,
+                user=user,
+            )
+
+    return True
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _list_batt_tables() -> pd.DataFrame:
@@ -872,6 +928,8 @@ def _normalize_blocks_df(df: pd.DataFrame) -> pd.DataFrame:
         else:
             if col == "is_excluded":
                 out[col] = 0
+    if "is_excluded" in out.columns and "est_disponible" in out.columns:
+        out.loc[out["est_disponible"] == 1, "is_excluded"] = 0
     return out.sort_values("date_debut").reset_index(drop=True)
 
 
@@ -992,13 +1050,17 @@ def calculate_availability(
     total = int(df["duration_minutes"].sum())
 
     missing_minutes = int(
-        df.loc[df["est_disponible"] == -1, "duration_minutes"].sum()
+        df.loc[
+            (df["est_disponible"] == -1) & (df["is_excluded"] == 0),
+            "duration_minutes",
+        ].sum()
     )
 
     if include_exclusions:
         available_mask = (
             (df["est_disponible"] == 1)
             | ((df["est_disponible"] == 0) & (df["is_excluded"] == 1))
+            | ((df["est_disponible"] == -1) & (df["is_excluded"] == 1))
         )
         unavailable_mask = (
             (df["est_disponible"] == 0) & (df["is_excluded"] == 0)
@@ -1087,7 +1149,9 @@ def _build_station_timeline_df(timelines: Dict[str, pd.DataFrame]) -> pd.DataFra
         -1: "⚠️ Donnée manquante",
     }
     timeline_df["state"] = timeline_df["est_disponible"].map(state_map).fillna("❓ Inconnu")
-    timeline_df["label"] = timeline_df["state"] + timeline_df["is_excluded"].map({1: " (Exclu)", 0: ""}).fillna("")
+    timeline_df["label"] = timeline_df["state"]
+    mask_excl = (timeline_df["is_excluded"] == 1) & (timeline_df["est_disponible"] != 1)
+    timeline_df.loc[mask_excl, "label"] = timeline_df.loc[mask_excl, "state"] + " (Exclu)"
     return timeline_df.sort_values(["Equipement", "start"]).reset_index(drop=True)
 
 
@@ -1408,12 +1472,15 @@ def _calculate_monthly_availability_equipment(
         SELECT site, equipement_id, date_debut, date_fin,
                est_disponible,
                TIMESTAMPDIFF(MINUTE, GREATEST(date_debut,:start), LEAST(date_fin,:end)) AS duration_minutes,
-               CAST(EXISTS (
-                 SELECT 1 FROM dispo_annotations a
-                 WHERE a.actif = 1 AND a.type_annotation='exclusion'
-                   AND a.site = site AND a.equipement_id = equipement_id
-                   AND NOT (a.date_fin <= date_debut OR a.date_debut >= date_fin)
-               ) AS UNSIGNED) AS is_excluded
+               CASE
+                 WHEN est_disponible <> 1 THEN CAST(EXISTS (
+                   SELECT 1 FROM dispo_annotations a
+                   WHERE a.actif = 1 AND a.type_annotation='exclusion'
+                     AND a.site = site AND a.equipement_id = equipement_id
+                     AND NOT (a.date_fin <= date_debut OR a.date_debut >= date_fin)
+                 ) AS UNSIGNED)
+                 ELSE 0
+               END AS is_excluded
         FROM dispo_blocs_with_exclusion_flag
         WHERE date_debut < :end AND date_fin > :start
     """
@@ -1463,12 +1530,15 @@ def _calculate_monthly_availability_equipment(
         SELECT
           b.site, b.equipement_id, b.date_debut, b.date_fin, b.est_disponible,
           TIMESTAMPDIFF(MINUTE, GREATEST(b.date_debut,:start), LEAST(b.date_fin,:end)) AS duration_minutes,
-          CAST(EXISTS (
-            SELECT 1 FROM dispo_annotations a
-            WHERE a.actif = 1 AND a.type_annotation='exclusion'
-              AND a.site = b.site AND a.equipement_id = b.equipement_id
-              AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
-          ) AS UNSIGNED) AS is_excluded
+          CASE
+            WHEN b.est_disponible <> 1 THEN CAST(EXISTS (
+              SELECT 1 FROM dispo_annotations a
+              WHERE a.actif = 1 AND a.type_annotation='exclusion'
+                AND a.site = b.site AND a.equipement_id = b.equipement_id
+                AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
+            ) AS UNSIGNED)
+            ELSE 0
+          END AS is_excluded
         FROM base b
         WHERE b.date_debut < :end AND b.date_fin > :start
           {equip_clause}
@@ -1517,12 +1587,15 @@ def _calculate_monthly_availability_pdc(
       p.date_fin,
       p.est_disponible,
       TIMESTAMPDIFF(MINUTE, GREATEST(p.date_debut,:start), LEAST(p.date_fin,:end)) AS duration_minutes,
-      CAST(EXISTS (
-        SELECT 1 FROM dispo_annotations a
-        WHERE a.actif = 1 AND a.type_annotation='exclusion'
-          AND a.site = p.site AND a.equipement_id = p.equipement_id
-          AND NOT (a.date_fin <= p.date_debut OR a.date_debut >= p.date_fin)
-      ) AS UNSIGNED) AS is_excluded
+      CASE
+        WHEN p.est_disponible <> 1 THEN CAST(EXISTS (
+          SELECT 1 FROM dispo_annotations a
+          WHERE a.actif = 1 AND a.type_annotation='exclusion'
+            AND a.site = p.site AND a.equipement_id = p.equipement_id
+            AND NOT (a.date_fin <= p.date_debut OR a.date_debut >= p.date_fin)
+        ) AS UNSIGNED)
+        ELSE 0
+      END AS is_excluded
     FROM pdc p
     WHERE p.date_debut < :end AND p.date_fin > :start
       {site_filter}
@@ -1751,12 +1824,15 @@ def generate_availability_report(
         SELECT
           b.site, b.equipement_id, b.date_debut, b.date_fin, b.est_disponible, b.cause,
           TIMESTAMPDIFF(MINUTE, GREATEST(b.date_debut,:start), LEAST(b.date_fin,:end)) AS duration_minutes,
-          CAST(EXISTS (
-            SELECT 1 FROM dispo_annotations a
-            WHERE a.actif = 1 AND a.type_annotation='exclusion'
-              AND a.site = b.site AND a.equipement_id = b.equipement_id
-              AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
-          ) AS UNSIGNED) AS is_excluded
+          CASE
+            WHEN b.est_disponible <> 1 THEN CAST(EXISTS (
+              SELECT 1 FROM dispo_annotations a
+              WHERE a.actif = 1 AND a.type_annotation='exclusion'
+                AND a.site = b.site AND a.equipement_id = b.equipement_id
+                AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
+            ) AS UNSIGNED)
+            ELSE 0
+          END AS is_excluded
         FROM base b
         WHERE b.date_debut < :end AND b.date_fin > :start
           {site_filter}
@@ -1796,12 +1872,15 @@ def generate_availability_report(
         SELECT
           b.site, b.equipement_id, b.date_debut, b.date_fin, b.est_disponible, b.cause,
           TIMESTAMPDIFF(MINUTE, GREATEST(b.date_debut,:start), LEAST(b.date_fin,:end)) AS duration_minutes,
-          CAST(EXISTS (
-            SELECT 1 FROM dispo_annotations a
-            WHERE a.actif = 1 AND a.type_annotation='exclusion'
-              AND a.site = b.site AND a.equipement_id = b.equipement_id
-              AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
-          ) AS UNSIGNED) AS is_excluded
+          CASE
+            WHEN b.est_disponible <> 1 THEN CAST(EXISTS (
+              SELECT 1 FROM dispo_annotations a
+              WHERE a.actif = 1 AND a.type_annotation='exclusion'
+                AND a.site = b.site AND a.equipement_id = b.equipement_id
+                AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
+            ) AS UNSIGNED)
+            ELSE 0
+          END AS is_excluded
         FROM base b
         WHERE b.date_debut < :end AND b.date_fin > :start
         ORDER BY b.equipement_id, b.date_debut
@@ -2076,20 +2155,33 @@ def render_filters() -> Tuple[Optional[str], Optional[str], datetime, datetime]:
         today = datetime.now(timezone.utc).date()
         c1, c2 = st.columns(2)
         
+        default_start = st.session_state.get("filter_start_date", today - timedelta(days=30))
         start_date = c1.date_input(
             "Date de début",
-            value=today - timedelta(days=30),
+            value=default_start,
             max_value=today,
+            key="filter_start_date",
             help="Date de début de la période d'analyse"
         )
-        
+
+        default_end = st.session_state.get("filter_end_date", today)
+        if isinstance(default_end, datetime):
+            default_end = default_end.date()
+        if default_end < start_date:
+            default_end = start_date
+
         end_date = c2.date_input(
             "Date de fin",
-            value=today,
+            value=default_end,
             min_value=start_date,
             max_value=today,
+            key="filter_end_date",
             help="Date de fin de la période d'analyse"
         )
+
+        if end_date < start_date:
+            st.session_state["filter_end_date"] = start_date
+            end_date = start_date
     
     start_dt = datetime.combine(start_date, time.min)
     end_dt = datetime.combine(end_date, time.max)
@@ -2153,6 +2245,83 @@ def render_overview_tab(df: Optional[pd.DataFrame]):
             format_minutes(stats_raw['unavailable_minutes']),
             help="Temps total d'indisponibilité brute"
         )
+
+    with st.expander("⚡ Exclusion rapide des données manquantes", expanded=False):
+        if 'selected_site' not in locals() or 'selected_equip' not in locals():
+            st.info("Sélectionnez d'abord un site et un équipement pour utiliser ce raccourci.")
+        else:
+            month_default = datetime.utcnow().date().replace(day=1)
+            target_month = st.date_input(
+                "Mois concerné",
+                value=month_default,
+                key="missing_month_picker",
+                help="Choisissez le mois pour lequel exclure toutes les données manquantes.",
+            )
+
+            month_start = target_month.replace(day=1)
+            if month_start.month == 12:
+                next_month = month_start.replace(year=month_start.year + 1, month=1)
+            else:
+                next_month = month_start.replace(month=month_start.month + 1)
+
+            default_comment = f"Exclusion automatique données manquantes {month_start.strftime('%Y-%m')}"
+            bulk_comment = st.text_input(
+                "Commentaire appliqué",
+                value=default_comment,
+                key="missing_month_comment",
+                help="Le commentaire sera répliqué sur chaque exclusion créée.",
+            )
+            bulk_user = st.text_input(
+                "Créé par",
+                placeholder="Votre nom",
+                key="missing_month_user",
+                help="Identifiez l'opérateur à l'origine de cette exclusion groupée.",
+            )
+
+            if st.button("🚫 Exclure toutes les données manquantes du mois", use_container_width=True, key="missing_month_button"):
+                comment_txt = bulk_comment.strip()
+                if len(comment_txt) < 10:
+                    st.error("❌ Le commentaire doit contenir au moins 10 caractères.")
+                else:
+                    start_dt = datetime.combine(month_start, time.min)
+                    end_dt = datetime.combine(next_month, time.min)
+                    user_txt = bulk_user.strip() or "Utilisateur UI"
+
+                    with st.spinner("Analyse des données manquantes en cours..."):
+                        df_month = load_blocks(selected_site, selected_equip, start_dt, end_dt, mode=mode)
+
+                    if df_month is None or df_month.empty:
+                        st.info("Aucune donnée disponible sur ce mois pour l'équipement sélectionné.")
+                    else:
+                        pending = df_month[(df_month["est_disponible"] == -1) & (df_month["is_excluded"] == 0)].copy()
+
+                        if pending.empty:
+                            st.success("Toutes les données manquantes de ce mois sont déjà exclues.")
+                        else:
+                            created = 0
+                            for _, block in pending.iterrows():
+                                start_block = block.get("date_debut")
+                                end_block = block.get("date_fin")
+                                if pd.isna(start_block) or pd.isna(end_block):
+                                    continue
+                                start_value = start_block.to_pydatetime() if hasattr(start_block, "to_pydatetime") else start_block
+                                end_value = end_block.to_pydatetime() if hasattr(end_block, "to_pydatetime") else end_block
+                                if create_annotation(
+                                    site=selected_site,
+                                    equip=selected_equip,
+                                    start_dt=start_value,
+                                    end_dt=end_value,
+                                    annotation_type="exclusion",
+                                    comment=comment_txt,
+                                    user=user_txt,
+                                ):
+                                    created += 1
+
+                            if created > 0:
+                                st.success(f"✅ {created} exclusion(s) ajoutée(s) pour {month_start.strftime('%Y-%m')}.")
+                                st.rerun()
+                            else:
+                                st.warning("Aucune exclusion supplémentaire n'a pu être créée.")
 
     st.divider()
     
@@ -2608,10 +2777,9 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
         -1: "⚠️ Donnée manquante"
     })
 
-    df_plot["excluded"] = df_plot["is_excluded"].map({
-        1: " (Exclu)",
-        0: ""
-    })
+    df_plot["excluded"] = ""
+    mask_excluded = (df_plot["is_excluded"] == 1) & (df_plot["est_disponible"] != 1)
+    df_plot.loc[mask_excluded, "excluded"] = " (Exclu)"
     df_plot["label"] = df_plot["state"] + df_plot["excluded"]
     
     fig = px.timeline(
@@ -2631,7 +2799,6 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
         },
         color_discrete_map={
             "✅ Disponible": "#28a745",
-            "✅ Disponible (Exclu)": "#20c997",
             "❌ Indisponible": "#dc3545",
             "❌ Indisponible (Exclu)": "#fd7e14",
             "⚠️ Donnée manquante": "#6c757d",
@@ -3044,7 +3211,84 @@ def render_exclusions_tab():
                         st.success("✅ Exclusion créée avec succès !")
                         st.rerun()
 
-   
+    with st.expander("⚡ Exclusion rapide des données manquantes", expanded=False):
+        if 'selected_site' not in locals() or 'selected_equip' not in locals():
+            st.info("Sélectionnez d'abord un site et un équipement pour utiliser ce raccourci.")
+        else:
+            month_default = datetime.utcnow().date().replace(day=1)
+            target_month = st.date_input(
+                "Mois concerné",
+                value=month_default,
+                key="missing_month_picker",
+                help="Choisissez le mois pour lequel exclure toutes les données manquantes.",
+            )
+
+            month_start = target_month.replace(day=1)
+            if month_start.month == 12:
+                next_month = month_start.replace(year=month_start.year + 1, month=1)
+            else:
+                next_month = month_start.replace(month=month_start.month + 1)
+
+            default_comment = f"Exclusion automatique données manquantes {month_start.strftime('%Y-%m')}"
+            bulk_comment = st.text_input(
+                "Commentaire appliqué",
+                value=default_comment,
+                key="missing_month_comment",
+                help="Le commentaire sera répliqué sur chaque exclusion créée.",
+            )
+            bulk_user = st.text_input(
+                "Créé par",
+                placeholder="Votre nom",
+                key="missing_month_user",
+                help="Identifiez l'opérateur à l'origine de cette exclusion groupée.",
+            )
+
+            if st.button("🚫 Exclure toutes les données manquantes du mois", use_container_width=True, key="missing_month_button"):
+                comment_txt = bulk_comment.strip()
+                if len(comment_txt) < 10:
+                    st.error("❌ Le commentaire doit contenir au moins 10 caractères.")
+                else:
+                    start_dt = datetime.combine(month_start, time.min)
+                    end_dt = datetime.combine(next_month, time.min)
+                    user_txt = bulk_user.strip() or "Utilisateur UI"
+
+                    with st.spinner("Analyse des données manquantes en cours..."):
+                        df_month = load_blocks(selected_site, selected_equip, start_dt, end_dt, mode=mode)
+
+                    if df_month is None or df_month.empty:
+                        st.info("Aucune donnée disponible sur ce mois pour l'équipement sélectionné.")
+                    else:
+                        pending = df_month[(df_month["est_disponible"] == -1) & (df_month["is_excluded"] == 0)].copy()
+
+                        if pending.empty:
+                            st.success("Toutes les données manquantes de ce mois sont déjà exclues.")
+                        else:
+                            created = 0
+                            for _, block in pending.iterrows():
+                                start_block = block.get("date_debut")
+                                end_block = block.get("date_fin")
+                                if pd.isna(start_block) or pd.isna(end_block):
+                                    continue
+                                start_value = start_block.to_pydatetime() if hasattr(start_block, "to_pydatetime") else start_block
+                                end_value = end_block.to_pydatetime() if hasattr(end_block, "to_pydatetime") else end_block
+                                if create_annotation(
+                                    site=selected_site,
+                                    equip=selected_equip,
+                                    start_dt=start_value,
+                                    end_dt=end_value,
+                                    annotation_type="exclusion",
+                                    comment=comment_txt,
+                                    user=user_txt,
+                                ):
+                                    created += 1
+
+                            if created > 0:
+                                st.success(f"✅ {created} exclusion(s) ajoutée(s) pour {month_start.strftime('%Y-%m')}.")
+                                st.rerun()
+                            else:
+                                st.warning("Aucune exclusion supplémentaire n'a pu être créée.")
+
+
     st.divider()
     
     st.subheader("📋 Exclusions Existantes")
@@ -3995,21 +4239,17 @@ def render_statistics_tab() -> None:
         uptime_minutes = int(metrics.get("uptime_minutes", max(reference_minutes - downtime_minutes, 0)))
         window_minutes = int(metrics.get("window_minutes", 0) or 0)
         coverage_pct = float(metrics.get("coverage_pct", 0.0) or 0.0)
-        downtime_occurrences = int(metrics.get("downtime_occurrences", 0) or 0)
-
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("Disponibilité estimée", f"{availability_pct:.2f}%")
         with col2:
-            st.metric("Indisponibilité cumulée", format_minutes(downtime_minutes))
+            st.metric("Indisponibilité réelle de la station", format_minutes(downtime_minutes))
         with col3:
             st.metric(
                 "Temps analysé",
                 format_minutes(reference_minutes),
                 help=f"{coverage_pct:.1f}% du total ({format_minutes(window_minutes)})"
             )
-        with col4:
-            st.metric("Occurrences station", downtime_occurrences)
 
         if window_minutes > 0 and coverage_pct < 80:
             st.warning("Couverture partielle des données : certaines périodes n'ont pas pu être analysées.")
@@ -4017,25 +4257,18 @@ def render_statistics_tab() -> None:
         if not summary_df.empty:
             display_df = summary_df.copy()
             display_df["Durée (min)"] = display_df["Durée_Minutes"].astype(int)
-            display_df["Durée"] = display_df["Durée_Minutes"].apply(lambda m: format_minutes(int(m)))
             display_df["Temps analysé (min)"] = display_df["Temps_Analysé_Minutes"].astype(int)
-            display_df["Temps analysé"] = display_df["Temps_Analysé_Minutes"].apply(lambda m: format_minutes(int(m)))
-            display_df["Part du temps analysé (%)"] = display_df["Part_Temps_Analysé"].astype(float)
-            display_df["Part du temps station (%)"] = display_df["Part_Temps_Station"].astype(float)
+            display_df["% temps analysé"] = display_df["Part_Temps_Analysé"].astype(float)
+            display_df["% temps station"] = display_df["Part_Temps_Station"].astype(float)
             display_df["Couverture période (%)"] = display_df["Couverture_Période"].astype(float)
-            display_df["Périodes clés"] = display_df["Périodes_Clés"]
 
             ordered_columns = [
                 "Condition",
-                "Occurrences",
                 "Durée (min)",
-                "Durée",
                 "Temps analysé (min)",
-                "Temps analysé",
-                "Part du temps analysé (%)",
-                "Part du temps station (%)",
+                "% temps analysé",
+                "% temps station",
                 "Couverture période (%)",
-                "Périodes clés",
             ]
 
             display_df = display_df[ordered_columns]
@@ -4046,15 +4279,11 @@ def render_statistics_tab() -> None:
                 use_container_width=True,
                 column_config={
                     "Condition": st.column_config.TextColumn("Condition", width="large"),
-                    "Occurrences": st.column_config.NumberColumn("Occurrences", width="small"),
                     "Durée (min)": st.column_config.NumberColumn("Durée (min)", width="small"),
-                    "Durée": st.column_config.TextColumn("Durée", width="medium"),
                     "Temps analysé (min)": st.column_config.NumberColumn("Temps analysé (min)", width="small"),
-                    "Temps analysé": st.column_config.TextColumn("Temps analysé", width="medium"),
-                    "Part du temps analysé (%)": st.column_config.NumberColumn("% temps analysé", format="%.2f%%", width="small"),
-                    "Part du temps station (%)": st.column_config.NumberColumn("% temps station", format="%.2f%%", width="small"),
+                    "% temps analysé": st.column_config.NumberColumn("% temps analysé", format="%.2f%%", width="small"),
+                    "% temps station": st.column_config.NumberColumn("% temps station", format="%.2f%%", width="small"),
                     "Couverture période (%)": st.column_config.NumberColumn("Couverture période (%)", format="%.1f%%", width="small"),
-                    "Périodes clés": st.column_config.TextColumn("Périodes clés", width="large"),
                 }
             )
         else:
@@ -4078,7 +4307,7 @@ def render_statistics_tab() -> None:
 
         downtime_df = _build_interval_table(downtime_intervals)
         if not downtime_df.empty:
-            with st.expander(f"Périodes d'indisponibilité station ({len(downtime_intervals)})"):
+            with st.expander(f"Périodes d'indisponibilité réelle de la station ({len(downtime_intervals)})"):
                 dt_display = downtime_df.copy()
                 dt_display["Début"] = dt_display["Début"].dt.strftime("%Y-%m-%d %H:%M")
                 dt_display["Fin"] = dt_display["Fin"].dt.strftime("%Y-%m-%d %H:%M")
@@ -4090,7 +4319,7 @@ def render_statistics_tab() -> None:
                     use_container_width=True,
                 )
         else:
-            st.info("Aucune période d'indisponibilité cumulée détectée pour la station.")
+            st.info("Aucune période d'indisponibilité réelle détectée pour la station.")
 
         if not timeline_df.empty:
             order = ["AC", "DC1", "DC2"] + [f"PDC{i}" for i in range(1, 7)]
@@ -4100,7 +4329,6 @@ def render_statistics_tab() -> None:
 
             color_map = {
                 "✅ Disponible": "#28a745",
-                "✅ Disponible (Exclu)": "#20c997",
                 "❌ Indisponible": "#dc3545",
                 "❌ Indisponible (Exclu)": "#fd7e14",
                 "⚠️ Donnée manquante": "#6c757d",
