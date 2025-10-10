@@ -164,6 +164,14 @@ def execute_write(query: str, params: Optional[Dict] = None) -> bool:
         st.error(f"❌ Erreur inattendue: {str(e)}")
         return False
 
+
+def delete_annotation(annotation_id: int) -> bool:
+    """Supprime définitivement une annotation identifiée par son ID."""
+    query = "DELETE FROM dispo_annotations WHERE id = :id"
+    params = {"id": annotation_id}
+    return execute_write(query, params)
+
+
 def invalidate_cache():
     """Invalide le cache de données."""
     st.cache_data.clear()
@@ -2246,83 +2254,6 @@ def render_overview_tab(df: Optional[pd.DataFrame]):
             help="Temps total d'indisponibilité brute"
         )
 
-    with st.expander("⚡ Exclusion rapide des données manquantes", expanded=False):
-        if 'selected_site' not in locals() or 'selected_equip' not in locals():
-            st.info("Sélectionnez d'abord un site et un équipement pour utiliser ce raccourci.")
-        else:
-            month_default = datetime.utcnow().date().replace(day=1)
-            target_month = st.date_input(
-                "Mois concerné",
-                value=month_default,
-                key="missing_month_picker",
-                help="Choisissez le mois pour lequel exclure toutes les données manquantes.",
-            )
-
-            month_start = target_month.replace(day=1)
-            if month_start.month == 12:
-                next_month = month_start.replace(year=month_start.year + 1, month=1)
-            else:
-                next_month = month_start.replace(month=month_start.month + 1)
-
-            default_comment = f"Exclusion automatique données manquantes {month_start.strftime('%Y-%m')}"
-            bulk_comment = st.text_input(
-                "Commentaire appliqué",
-                value=default_comment,
-                key="missing_month_comment",
-                help="Le commentaire sera répliqué sur chaque exclusion créée.",
-            )
-            bulk_user = st.text_input(
-                "Créé par",
-                placeholder="Votre nom",
-                key="missing_month_user",
-                help="Identifiez l'opérateur à l'origine de cette exclusion groupée.",
-            )
-
-            if st.button("🚫 Exclure toutes les données manquantes du mois", use_container_width=True, key="missing_month_button"):
-                comment_txt = bulk_comment.strip()
-                if len(comment_txt) < 10:
-                    st.error("❌ Le commentaire doit contenir au moins 10 caractères.")
-                else:
-                    start_dt = datetime.combine(month_start, time.min)
-                    end_dt = datetime.combine(next_month, time.min)
-                    user_txt = bulk_user.strip() or "Utilisateur UI"
-
-                    with st.spinner("Analyse des données manquantes en cours..."):
-                        df_month = load_blocks(selected_site, selected_equip, start_dt, end_dt, mode=mode)
-
-                    if df_month is None or df_month.empty:
-                        st.info("Aucune donnée disponible sur ce mois pour l'équipement sélectionné.")
-                    else:
-                        pending = df_month[(df_month["est_disponible"] == -1) & (df_month["is_excluded"] == 0)].copy()
-
-                        if pending.empty:
-                            st.success("Toutes les données manquantes de ce mois sont déjà exclues.")
-                        else:
-                            created = 0
-                            for _, block in pending.iterrows():
-                                start_block = block.get("date_debut")
-                                end_block = block.get("date_fin")
-                                if pd.isna(start_block) or pd.isna(end_block):
-                                    continue
-                                start_value = start_block.to_pydatetime() if hasattr(start_block, "to_pydatetime") else start_block
-                                end_value = end_block.to_pydatetime() if hasattr(end_block, "to_pydatetime") else end_block
-                                if create_annotation(
-                                    site=selected_site,
-                                    equip=selected_equip,
-                                    start_dt=start_value,
-                                    end_dt=end_value,
-                                    annotation_type="exclusion",
-                                    comment=comment_txt,
-                                    user=user_txt,
-                                ):
-                                    created += 1
-
-                            if created > 0:
-                                st.success(f"✅ {created} exclusion(s) ajoutée(s) pour {month_start.strftime('%Y-%m')}.")
-                                st.rerun()
-                            else:
-                                st.warning("Aucune exclusion supplémentaire n'a pu être créée.")
-
     st.divider()
     
     # Tableau récapitulatif des 3 équipements
@@ -3062,6 +2993,94 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
                         st.balloons()
                         st.rerun()
 
+    with st.expander("⚡ Exclusion rapide des données manquantes", expanded=False):
+        month_default = datetime.utcnow().date().replace(day=1)
+        target_month = st.date_input(
+            "Mois concerné",
+            value=month_default,
+            key="timeline_missing_month_picker",
+            help="Choisissez une date dans le mois pour exclure automatiquement toutes les données manquantes.",
+        )
+
+        month_start = target_month.replace(day=1)
+        if month_start.month == 12:
+            next_month = month_start.replace(year=month_start.year + 1, month=1)
+        else:
+            next_month = month_start.replace(month=month_start.month + 1)
+
+        default_comment = f"Exclusion automatique données manquantes {month_start.strftime('%Y-%m')}"
+        bulk_comment = st.text_input(
+            "Commentaire appliqué",
+            value=default_comment,
+            key="timeline_missing_month_comment",
+            help="Le commentaire sera répliqué sur chaque exclusion créée.",
+        )
+        bulk_user = st.text_input(
+            "Créé par",
+            placeholder="Votre nom",
+            key="timeline_missing_month_user",
+            help="Identifiez l'opérateur à l'origine de cette exclusion groupée.",
+        )
+
+        if st.button(
+            "🚫 Exclure toutes les données manquantes du mois",
+            use_container_width=True,
+            key="timeline_missing_month_button",
+        ):
+            comment_txt = bulk_comment.strip()
+            if len(comment_txt) < 10:
+                st.error("❌ Le commentaire doit contenir au moins 10 caractères.")
+            else:
+                start_dt = datetime.combine(month_start, time.min)
+                end_dt = datetime.combine(next_month, time.min)
+                user_txt = bulk_user.strip() or "Utilisateur UI"
+
+                with st.spinner("Analyse des données manquantes en cours..."):
+                    df_month = load_blocks(site, equip, start_dt, end_dt, mode=mode)
+
+                if df_month is None or df_month.empty:
+                    st.info("Aucune donnée disponible sur ce mois pour l'équipement sélectionné.")
+                else:
+                    pending = df_month[(df_month["est_disponible"] == -1) & (df_month["is_excluded"] == 0)].copy()
+
+                    if pending.empty:
+                        st.success("Toutes les données manquantes de ce mois sont déjà exclues.")
+                    else:
+                        created = 0
+                        for _, block in pending.iterrows():
+                            start_block = block.get("date_debut")
+                            end_block = block.get("date_fin")
+                            if pd.isna(start_block) or pd.isna(end_block):
+                                continue
+                            start_value = (
+                                start_block.to_pydatetime()
+                                if hasattr(start_block, "to_pydatetime")
+                                else start_block
+                            )
+                            end_value = (
+                                end_block.to_pydatetime()
+                                if hasattr(end_block, "to_pydatetime")
+                                else end_block
+                            )
+                            if create_annotation(
+                                site=site,
+                                equip=equip,
+                                start_dt=start_value,
+                                end_dt=end_value,
+                                annotation_type="exclusion",
+                                comment=comment_txt,
+                                user=user_txt,
+                            ):
+                                created += 1
+
+                        if created > 0:
+                            st.success(
+                                f"✅ {created} exclusion(s) ajoutée(s) pour {month_start.strftime('%Y-%m')}"
+                            )
+                            st.rerun()
+                        else:
+                            st.warning("Aucune exclusion supplémentaire n'a pu être créée.")
+
     equip_current = st.session_state.get("current_equip")
     if equip_current:
         cfg = get_equip_config(equip_current)
@@ -3097,10 +3116,6 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
 
 def render_exclusions_tab():
     mode = get_current_mode()
-    def delete_annotation(annotation_id: int) -> bool:
-        query = "DELETE FROM dispo_annotations WHERE id = :id"
-        params = {"id": annotation_id}
-        return execute_write(query, params)
     st.header("🚫 Gestion des Exclusions")
     
     st.markdown("""
@@ -3210,83 +3225,6 @@ def render_exclusions_tab():
                     if success:
                         st.success("✅ Exclusion créée avec succès !")
                         st.rerun()
-
-    with st.expander("⚡ Exclusion rapide des données manquantes", expanded=False):
-        if 'selected_site' not in locals() or 'selected_equip' not in locals():
-            st.info("Sélectionnez d'abord un site et un équipement pour utiliser ce raccourci.")
-        else:
-            month_default = datetime.utcnow().date().replace(day=1)
-            target_month = st.date_input(
-                "Mois concerné",
-                value=month_default,
-                key="missing_month_picker",
-                help="Choisissez le mois pour lequel exclure toutes les données manquantes.",
-            )
-
-            month_start = target_month.replace(day=1)
-            if month_start.month == 12:
-                next_month = month_start.replace(year=month_start.year + 1, month=1)
-            else:
-                next_month = month_start.replace(month=month_start.month + 1)
-
-            default_comment = f"Exclusion automatique données manquantes {month_start.strftime('%Y-%m')}"
-            bulk_comment = st.text_input(
-                "Commentaire appliqué",
-                value=default_comment,
-                key="missing_month_comment",
-                help="Le commentaire sera répliqué sur chaque exclusion créée.",
-            )
-            bulk_user = st.text_input(
-                "Créé par",
-                placeholder="Votre nom",
-                key="missing_month_user",
-                help="Identifiez l'opérateur à l'origine de cette exclusion groupée.",
-            )
-
-            if st.button("🚫 Exclure toutes les données manquantes du mois", use_container_width=True, key="missing_month_button"):
-                comment_txt = bulk_comment.strip()
-                if len(comment_txt) < 10:
-                    st.error("❌ Le commentaire doit contenir au moins 10 caractères.")
-                else:
-                    start_dt = datetime.combine(month_start, time.min)
-                    end_dt = datetime.combine(next_month, time.min)
-                    user_txt = bulk_user.strip() or "Utilisateur UI"
-
-                    with st.spinner("Analyse des données manquantes en cours..."):
-                        df_month = load_blocks(selected_site, selected_equip, start_dt, end_dt, mode=mode)
-
-                    if df_month is None or df_month.empty:
-                        st.info("Aucune donnée disponible sur ce mois pour l'équipement sélectionné.")
-                    else:
-                        pending = df_month[(df_month["est_disponible"] == -1) & (df_month["is_excluded"] == 0)].copy()
-
-                        if pending.empty:
-                            st.success("Toutes les données manquantes de ce mois sont déjà exclues.")
-                        else:
-                            created = 0
-                            for _, block in pending.iterrows():
-                                start_block = block.get("date_debut")
-                                end_block = block.get("date_fin")
-                                if pd.isna(start_block) or pd.isna(end_block):
-                                    continue
-                                start_value = start_block.to_pydatetime() if hasattr(start_block, "to_pydatetime") else start_block
-                                end_value = end_block.to_pydatetime() if hasattr(end_block, "to_pydatetime") else end_block
-                                if create_annotation(
-                                    site=selected_site,
-                                    equip=selected_equip,
-                                    start_dt=start_value,
-                                    end_dt=end_value,
-                                    annotation_type="exclusion",
-                                    comment=comment_txt,
-                                    user=user_txt,
-                                ):
-                                    created += 1
-
-                            if created > 0:
-                                st.success(f"✅ {created} exclusion(s) ajoutée(s) pour {month_start.strftime('%Y-%m')}.")
-                                st.rerun()
-                            else:
-                                st.warning("Aucune exclusion supplémentaire n'a pu être créée.")
 
 
     st.divider()
@@ -3440,8 +3378,8 @@ def render_comments_tab():
                     help="Modifiez le texte du commentaire"
                 )
                 
-                col1, col2 = st.columns(2)
-                
+                col1, col2, col3 = st.columns(3)
+
                 with col1:
                     if st.button("💾 Enregistrer les modifications", type="primary", use_container_width=True):
                         if not new_text :
@@ -3463,6 +3401,14 @@ def render_comments_tab():
                             if toggle_annotation(selected_id, True):
                                 st.success(f"✅ Commentaire #{selected_id} activé !")
                                 st.rerun()
+
+                with col3:
+                    if st.button("🗑️ Supprimer définitivement", use_container_width=True, type="secondary"):
+                        if delete_annotation(int(selected_id)):
+                            st.success(f"✅ Commentaire #{selected_id} supprimé !")
+                            st.rerun()
+                        else:
+                            st.error("❌ Échec de la suppression (voir logs)")
 
 
 
@@ -4256,19 +4202,17 @@ def render_statistics_tab() -> None:
 
         if not summary_df.empty:
             display_df = summary_df.copy()
-            display_df["Durée (min)"] = display_df["Durée_Minutes"].astype(int)
-            display_df["Temps analysé (min)"] = display_df["Temps_Analysé_Minutes"].astype(int)
-            display_df["% temps analysé"] = display_df["Part_Temps_Analysé"].astype(float)
-            display_df["% temps station"] = display_df["Part_Temps_Station"].astype(float)
-            display_df["Couverture période (%)"] = display_df["Couverture_Période"].astype(float)
+            display_df["Temps analysé"] = display_df["Temps_Analysé_Minutes"].apply(
+                lambda m: format_minutes(int(m))
+            )
+            display_df["Durée"] = display_df["Durée_Minutes"].apply(
+                lambda m: format_minutes(int(m))
+            )
 
             ordered_columns = [
                 "Condition",
-                "Durée (min)",
-                "Temps analysé (min)",
-                "% temps analysé",
-                "% temps station",
-                "Couverture période (%)",
+                "Durée",
+                "Temps analysé",
             ]
 
             display_df = display_df[ordered_columns]
@@ -4279,11 +4223,8 @@ def render_statistics_tab() -> None:
                 use_container_width=True,
                 column_config={
                     "Condition": st.column_config.TextColumn("Condition", width="large"),
-                    "Durée (min)": st.column_config.NumberColumn("Durée (min)", width="small"),
-                    "Temps analysé (min)": st.column_config.NumberColumn("Temps analysé (min)", width="small"),
-                    "% temps analysé": st.column_config.NumberColumn("% temps analysé", format="%.2f%%", width="small"),
-                    "% temps station": st.column_config.NumberColumn("% temps station", format="%.2f%%", width="small"),
-                    "Couverture période (%)": st.column_config.NumberColumn("Couverture période (%)", format="%.1f%%", width="small"),
+                    "Durée": st.column_config.TextColumn("Durée", width="medium"),
+                    "Temps analysé": st.column_config.TextColumn("Temps analysé", width="medium"),
                 }
             )
         else:
