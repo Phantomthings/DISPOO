@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from itertools import cycle
-from typing import Any, Dict, Optional, List, Tuple, Set
+from typing import Any, Dict, Optional, List, Tuple, Set, Callable
 import logging
 
 import pandas as pd
@@ -3114,6 +3114,52 @@ def render_timeline_tab(site: Optional[str], equip: Optional[str], start_dt: dat
                 disabled=True
             )
 
+
+def render_inline_delete_table(
+    df: pd.DataFrame,
+    column_settings: List[Tuple[str, str, float]],
+    key_prefix: str,
+    delete_handler: Callable[[int], bool],
+    success_message: str,
+    error_message: str,
+) -> None:
+    """Affiche un tableau avec un bouton de suppression sur chaque ligne."""
+
+    if df.empty:
+        return
+
+    columns = [field for field, _, _ in column_settings]
+    df_to_display = df[columns].copy()
+
+    weights = [weight for _, _, weight in column_settings] + [0.8]
+
+    header_cols = st.columns(weights)
+    for container, (_, header, _) in zip(header_cols[:-1], column_settings):
+        container.markdown(f"**{header}**")
+    header_cols[-1].markdown("**Action**")
+
+    for _, row in df_to_display.iterrows():
+        row_cols = st.columns(weights)
+        for container, (field, _, _) in zip(row_cols[:-1], column_settings):
+            value = row[field]
+            if pd.isna(value) or value == "":
+                display_value = "—"
+            else:
+                display_value = value
+            container.write(display_value)
+
+        action_container = row_cols[-1]
+        button_key = f"{key_prefix}_delete_{row['id']}"
+        with action_container:
+            if st.button("🗑️ Supprimer", key=button_key, use_container_width=True):
+                row_id = int(row["id"])
+                if delete_handler(row_id):
+                    st.success(success_message.format(id=row_id))
+                    st.rerun()
+                else:
+                    st.error(error_message.format(id=row_id))
+
+
 def render_exclusions_tab():
     mode = get_current_mode()
     st.header("🚫 Gestion des Exclusions")
@@ -3242,21 +3288,29 @@ def render_exclusions_tab():
         df_display["Statut"] = df_display["actif"].map({1: "✅ Active", 0: "❌ Inactive"})
         df_display["Créé le"] = pd.to_datetime(df_display["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
         
-        st.dataframe(
-            df_display[[
-                "id", "site", "equipement_id", "Période", 
-                "Statut", "commentaire", "created_by", "Créé le"
-            ]],
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "id": st.column_config.NumberColumn("ID", width="small"),
-                "commentaire": st.column_config.TextColumn("Commentaire", width="large")
-            }
+        columns_config = [
+            ("id", "ID", 0.8),
+            ("site", "Site", 1.1),
+            ("equipement_id", "Équipement", 1.2),
+            ("Période", "Période", 1.8),
+            ("Statut", "Statut", 1.0),
+            ("commentaire", "Commentaire", 2.5),
+            ("created_by", "Créé par", 1.2),
+            ("Créé le", "Créé le", 1.3),
+        ]
+
+        st.caption("Cliquez sur 🗑️ pour supprimer une exclusion directement depuis la liste.")
+        render_inline_delete_table(
+            df_display,
+            column_settings=columns_config,
+            key_prefix="exclusion",
+            delete_handler=delete_annotation,
+            success_message="✅ Exclusion #{id} supprimée !",
+            error_message="❌ Échec de suppression pour l'exclusion #{id}."
         )
-        
+
         st.subheader("⚙️ Gérer une Exclusion")
-        
+
         col1, col2 = st.columns([2, 1])
         
         with col1:
@@ -3285,8 +3339,8 @@ def render_exclusions_tab():
                 📊 Statut: {"✅ Active" if is_active else "❌ Inactive"}
                 """)
                 
-                col_btn1, col_btn2 = st.columns(2)
-                
+                col_btn1, col_info = st.columns([1, 1])
+
                 with col_btn1:
                     if not is_active:
                         if st.button("✅ Activer", use_container_width=True, type="primary"):
@@ -3298,14 +3352,9 @@ def render_exclusions_tab():
                             if toggle_annotation(selected_id, False):
                                 st.warning(f"⚠️ Exclusion #{selected_id} désactivée !")
                                 st.rerun()
-                                
-                with col_btn2:
-                    if st.button("🗑️ Supprimer définitivement", use_container_width=True, type="secondary"):
-                        if delete_annotation(int(selected_id)):
-                            st.success(f"✅ Annotation #{selected_id} supprimée !")
-                            st.rerun()
-                        else:
-                            st.error("❌ Échec de suppression (voir logs)")
+
+                with col_info:
+                    st.caption("🗑️ Utilisez la liste ci-dessus pour supprimer une exclusion.")
 
 def render_comments_tab():
     """Affiche l'onglet de gestion des commentaires."""
@@ -3333,17 +3382,25 @@ def render_comments_tab():
         df_display["Créé le"] = pd.to_datetime(df_display["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
         df_display["Statut"] = df_display["actif"].map({1: "✅ Actif", 0: "❌ Inactif"})
         
-        st.dataframe(
-            df_display[[
-                "id", "site", "equipement_id", "Période",
-                "commentaire", "Statut", "created_by", "Créé le"
-            ]],
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "id": st.column_config.NumberColumn("ID", width="small"),
-                "commentaire": st.column_config.TextColumn("Commentaire", width="large")
-            }
+        columns_config = [
+            ("id", "ID", 0.8),
+            ("site", "Site", 1.1),
+            ("equipement_id", "Équipement", 1.2),
+            ("Période", "Période", 1.8),
+            ("commentaire", "Commentaire", 2.5),
+            ("Statut", "Statut", 1.0),
+            ("created_by", "Créé par", 1.2),
+            ("Créé le", "Créé le", 1.3),
+        ]
+
+        st.caption("Cliquez sur 🗑️ pour supprimer un commentaire directement depuis la liste.")
+        render_inline_delete_table(
+            df_display,
+            column_settings=columns_config,
+            key_prefix="comment",
+            delete_handler=delete_annotation,
+            success_message="✅ Commentaire #{id} supprimé !",
+            error_message="❌ Échec de suppression pour le commentaire #{id}."
         )
         
         st.subheader("✏️ Éditer un Commentaire")
@@ -3378,7 +3435,7 @@ def render_comments_tab():
                     help="Modifiez le texte du commentaire"
                 )
                 
-                col1, col2, col3 = st.columns(3)
+                col1, col2 = st.columns(2)
 
                 with col1:
                     if st.button("💾 Enregistrer les modifications", type="primary", use_container_width=True):
@@ -3402,13 +3459,7 @@ def render_comments_tab():
                                 st.success(f"✅ Commentaire #{selected_id} activé !")
                                 st.rerun()
 
-                with col3:
-                    if st.button("🗑️ Supprimer définitivement", use_container_width=True, type="secondary"):
-                        if delete_annotation(int(selected_id)):
-                            st.success(f"✅ Commentaire #{selected_id} supprimé !")
-                            st.rerun()
-                        else:
-                            st.error("❌ Échec de la suppression (voir logs)")
+                st.caption("🗑️ Utilisez la liste ci-dessus pour supprimer un commentaire.")
 
 
 
