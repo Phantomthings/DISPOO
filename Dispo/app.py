@@ -4410,8 +4410,6 @@ def render_statistics_tab() -> None:
                 with st.spinner("Génération du PDF..."):
                     try:
                         from export import SiteReport, generate_statistics_pdf  # type: ignore
-                    except ModuleNotFoundError:
-                        from Dispo.export import SiteReport, generate_statistics_pdf  # type: ignore
 
                         site_reports = [
                             SiteReport(
