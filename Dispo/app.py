@@ -4210,6 +4210,16 @@ def render_statistics_tab() -> None:
         st.info("Sélectionnez au moins un site pour afficher la vue statistique.")
         return
 
+    export_payloads: List[Dict[str, Any]] = []
+    export_key = (
+        f"{start_dt.isoformat()}_{end_dt.isoformat()}_"
+        f"{','.join(sorted(selected_sites))}"
+    )
+    if st.session_state.get("statistics_pdf_key") != export_key:
+        st.session_state.pop("statistics_pdf_bytes", None)
+        st.session_state.pop("statistics_pdf_filename", None)
+        st.session_state["statistics_pdf_key"] = export_key
+
     for idx, site in enumerate(selected_sites, start=1):
         site_label = mapping_sites.get(site.split("_")[-1], site)
         st.subheader(f"📍 {site_label} ({site})")
@@ -4360,8 +4370,92 @@ def render_statistics_tab() -> None:
 
         st.caption(f"Temps disponible estimé : {format_minutes(uptime_minutes)}")
 
+        try:
+            equipment_summary = get_equipment_summary(start_dt, end_dt, site, mode=MODE_EQUIPMENT)
+        except Exception:
+            equipment_summary = pd.DataFrame()
+
+        try:
+            raw_blocks = load_filtered_blocks(start_dt, end_dt, site, None, mode=MODE_EQUIPMENT)
+            if not raw_blocks.empty:
+                raw_blocks = raw_blocks[[
+                    "date_debut",
+                    "date_fin",
+                    "est_disponible",
+                    "cause",
+                ]].copy()
+        except Exception:
+            raw_blocks = pd.DataFrame(columns=["date_debut", "date_fin", "est_disponible", "cause"])
+
+        export_payloads.append(
+            {
+                "site": site,
+                "site_label": site_label,
+                "metrics": metrics,
+                "summary_df": summary_df.copy() if summary_df is not None else pd.DataFrame(),
+                "equipment_summary": equipment_summary.copy() if equipment_summary is not None else pd.DataFrame(),
+                "raw_blocks": raw_blocks.copy(),
+            }
+        )
+
         if idx < len(selected_sites):
             st.divider()
+
+    if export_payloads:
+        st.divider()
+        controls_col, download_col = st.columns([1, 3])
+
+        with controls_col:
+            if st.button("📄 Générer le PDF", key="generate_statistics_pdf"):
+                with st.spinner("Génération du PDF..."):
+                    try:
+                        from export import SiteReport, generate_statistics_pdf  # type: ignore
+
+                        site_reports = [
+                            SiteReport(
+                                site=payload["site"],
+                                site_label=payload["site_label"],
+                                metrics=payload["metrics"],
+                                summary_df=payload["summary_df"],
+                                equipment_summary=payload["equipment_summary"],
+                                raw_blocks=payload["raw_blocks"],
+                            )
+                            for payload in export_payloads
+                        ]
+
+                        pdf_bytes = generate_statistics_pdf(
+                            site_reports,
+                            start_dt,
+                            end_dt,
+                            title="rapport mensuel de disponibilité",
+                        )
+                    except ImportError as exc:
+                        st.error(str(exc))
+                    except Exception as exc:  # pragma: no cover - UI feedback
+                        logger.exception("Erreur lors de la génération du PDF")
+                        st.error(f"Impossible de générer le PDF : {exc}")
+                    else:
+                        filename = (
+                            f"rapport_disponibilite_"
+                            f"{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}.pdf"
+                        )
+                        st.session_state["statistics_pdf_bytes"] = pdf_bytes
+                        st.session_state["statistics_pdf_filename"] = filename
+                        st.success("PDF généré. Utilisez le bouton de téléchargement.")
+
+        with download_col:
+            pdf_bytes = st.session_state.get("statistics_pdf_bytes")
+            if pdf_bytes:
+                filename = st.session_state.get(
+                    "statistics_pdf_filename",
+                    "rapport_disponibilite.pdf",
+                )
+                st.download_button(
+                    "⬇️ Télécharger le PDF",
+                    data=pdf_bytes,
+                    file_name=filename,
+                    mime="application/pdf",
+                )
 
 
 def main():
