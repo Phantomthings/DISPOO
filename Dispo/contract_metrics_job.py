@@ -25,6 +25,38 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 CONTRACT_TABLE = "dispo_contract_monthly"
 
+ANNOTATION_TYPE_EXCLUSION = "exclusion"
+ANNOTATION_TYPE_MISSING_AVAILABLE = "missing_excl_available"
+ANNOTATION_TYPE_MISSING_UNAVAILABLE = "missing_excl_unavailable"
+
+
+def _missing_exclusion_case(alias: str) -> str:
+    return f"""
+        CASE
+          WHEN {alias}.est_disponible = -1 THEN
+            CASE
+              WHEN EXISTS (
+                SELECT 1 FROM dispo_annotations m
+                WHERE m.actif = 1
+                  AND m.type_annotation = '{ANNOTATION_TYPE_MISSING_UNAVAILABLE}'
+                  AND m.site = {alias}.site
+                  AND m.equipement_id = {alias}.equipement_id
+                  AND NOT (m.date_fin <= {alias}.date_debut OR m.date_debut >= {alias}.date_fin)
+              ) THEN 2
+              WHEN EXISTS (
+                SELECT 1 FROM dispo_annotations m
+                WHERE m.actif = 1
+                  AND m.type_annotation = '{ANNOTATION_TYPE_MISSING_AVAILABLE}'
+                  AND m.site = {alias}.site
+                  AND m.equipement_id = {alias}.equipement_id
+                  AND NOT (m.date_fin <= {alias}.date_debut OR m.date_debut >= {alias}.date_fin)
+              ) THEN 1
+              ELSE 0
+            END
+          ELSE 0
+        END
+    """
+
 
 @dataclass
 class DBConfig:
@@ -81,11 +113,11 @@ def _normalize_blocks_df(df: pd.DataFrame) -> pd.DataFrame:
             except Exception:
                 pass
             out[col] = series
-    for col in ["est_disponible", "raw_point_count", "duration_minutes", "is_excluded"]:
+    for col in ["est_disponible", "raw_point_count", "duration_minutes", "is_excluded", "missing_exclusion_mode"]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
         else:
-            if col == "is_excluded":
+            if col in {"is_excluded", "missing_exclusion_mode"}:
                 out[col] = 0
     return out.sort_values("date_debut").reset_index(drop=True)
 
@@ -268,14 +300,29 @@ def _load_filtered_blocks_equipment(
 ) -> pd.DataFrame:
     params = {"site": site, "equip": equip, "start": start_dt, "end": end_dt}
     try:
-        q_view = """
-            SELECT *
-            FROM dispo_blocs_with_exclusion_flag
-            WHERE site = :site
-              AND equipement_id = :equip
-              AND date_debut < :end
-              AND date_fin > :start
-            ORDER BY date_debut
+        missing_case = _missing_exclusion_case("v")
+        q_view = f"""
+            SELECT
+              v.site,
+              v.equipement_id,
+              v.type_equipement,
+              v.date_debut,
+              v.date_fin,
+              v.est_disponible,
+              v.cause,
+              v.raw_point_count,
+              v.processed_at,
+              v.batch_id,
+              v.hash_signature,
+              TIMESTAMPDIFF(MINUTE, v.date_debut, v.date_fin) AS duration_minutes,
+              v.is_excluded,
+              {missing_case} AS missing_exclusion_mode
+            FROM dispo_blocs_with_exclusion_flag v
+            WHERE v.site = :site
+              AND v.equipement_id = :equip
+              AND v.date_debut < :end
+              AND v.date_fin > :start
+            ORDER BY v.date_debut
         """
         df = execute_query(engine, q_view, params)
         if not df.empty:
@@ -285,6 +332,7 @@ def _load_filtered_blocks_equipment(
 
     union_ac = _ac_union_sql_for_site(engine, site)
     union_bt = _batt_union_sql_for_site(engine, site)
+    missing_case = _missing_exclusion_case("b")
     q = f"""
         WITH ac AS (
             {union_ac}
@@ -313,11 +361,12 @@ def _load_filtered_blocks_equipment(
           CAST(EXISTS (
             SELECT 1 FROM dispo_annotations a
             WHERE a.actif = 1
-              AND a.type_annotation = 'exclusion'
+              AND a.type_annotation = '{ANNOTATION_TYPE_EXCLUSION}'
               AND a.site = b.site
               AND a.equipement_id = b.equipement_id
               AND NOT (a.date_fin <= b.date_debut OR a.date_debut >= b.date_fin)
-          ) AS UNSIGNED) AS is_excluded
+          ) AS UNSIGNED) AS is_excluded,
+          {missing_case} AS missing_exclusion_mode
         FROM base b
         WHERE b.site = :site
           AND b.equipement_id = :equip
@@ -338,6 +387,7 @@ def _load_filtered_blocks_pdc(
 ) -> pd.DataFrame:
     params = {"site": site, "equip": equip, "start": start_dt, "end": end_dt}
     union_sql = _pdc_union_sql_for_site(engine, site)
+    missing_case = _missing_exclusion_case("p")
     q = f"""
         WITH pdc AS (
             {union_sql}
@@ -358,11 +408,12 @@ def _load_filtered_blocks_pdc(
           CAST(EXISTS (
             SELECT 1 FROM dispo_annotations a
             WHERE a.actif = 1
-              AND a.type_annotation = 'exclusion'
+              AND a.type_annotation = '{ANNOTATION_TYPE_EXCLUSION}'
               AND a.site = p.site
               AND a.equipement_id = p.equipement_id
               AND NOT (a.date_fin <= p.date_debut OR a.date_debut >= p.date_fin)
-          ) AS UNSIGNED) AS is_excluded
+          ) AS UNSIGNED) AS is_excluded,
+          {missing_case} AS missing_exclusion_mode
         FROM pdc p
         WHERE p.site = :site
           AND p.equipement_id = :equip
