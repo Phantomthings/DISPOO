@@ -30,6 +30,8 @@ class AvailabilityTimeline:
 
         start, end, available, is_excluded = self.intervals[idx]
         if start <= ts < end:
+            if available == -1:
+                return False, is_excluded == 1, False
             return available == 1, is_excluded == 1, True
         return False, False, False
 
@@ -86,8 +88,19 @@ def build_timeline(
         end_clipped = min(end_ts, end)
         if pd.isna(start_clipped) or pd.isna(end_clipped) or start_clipped >= end_clipped:
             continue
-        available = int(row.get("est_disponible", 0))
+        est = int(row.get("est_disponible", 0))
+        missing_mode = int(row.get("missing_exclusion_mode", 0))
+        available = est
         is_excluded = int(row.get("is_excluded", 0))
+        if est == -1:
+            if missing_mode == 1:
+                available = 1
+                is_excluded = 1
+            elif missing_mode == 2:
+                available = 0
+                is_excluded = 1
+            else:
+                available = -1
         records.append((start_clipped, end_clipped, available, is_excluded))
 
     records.sort(key=lambda item: item[0])
